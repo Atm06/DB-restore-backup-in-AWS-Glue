@@ -1,50 +1,104 @@
 #!/bin/bash
 
-# Set the database name and backup filename
-DB_NAME=my_database
-BACKUP_FILE=my_database_backup.sql.gz
+folder_path="/home/ec2-user/folder1"
 
-# Set the S3 bucket and key for the backup file
-BUCKET=my_s3_bucket
-KEY=my_backup_folder/$BACKUP_FILE
+#AWS SES CONFIGURATION
 
-# Set the email address for the status email
-EMAIL=youremail@example.com
+AWS_REGION="ap-south-1"
 
-# Set the timestamp for the status email subject
-TIMESTAMP=$(date +%Y-%m-%d_%H:%M:%S)
+AWS_ACCESS_KEY_ID=""
 
-# Set the Glue job name and IAM role
-JOB_NAME=my_glue_job_name
-ROLE_NAME=my_iam_role_name
+AWS_SECRET_ACCESS_KEY=""
 
-# Unzip the backup file
-gunzip $BACKUP_FILE
+DB_USER="root"
 
-# Restore the database from the backup file using Glue
-aws glue start-job-run --job-name $JOB_NAME --arguments \
-    '{"--database-name": "'$DB_NAME'", "--s3-backup-path": "s3://'$BUCKET'/'$KEY'", "--overwrite-existing-tables": "true"}' \
-    --output text --query 'JobRunId' > job_run_id.txt
+DB_PASSWORD="redhat"
 
-# Check the status of the Glue job and send a status email
-STATUS=$(aws glue get-job-run --job-name $JOB_NAME --run-id $(cat job_run_id.txt) --query 'JobRun.JobRunState' --output text)
+log_dir="/var/log/db_scripts"
+log_file="$log_dir/$(date +"%Y-%m-%d")_db_creation.log"
 
-if [ "$STATUS" = "SUCCEEDED" ]; then
-    echo "Database restore completed successfully."
-    echo "Removing backup file..."
-    rm $BACKUP_FILE
-    echo "Backup file removed."
-    echo "Sending status email..."
-    echo "Subject: Database restore completed successfully ($TIMESTAMP)" | \
-        aws ses send-email --from "youremail@example.com" --to "$EMAIL" --output text
-    echo "Status email sent."
-else
-    echo "Database restore failed."
-    echo "Sending status email..."
-    echo "Subject: Database restore failed ($TIMESTAMP)" | \
-        aws ses send-email --from "youremail@example.com" --to "$EMAIL" --output text
-    echo "Status email sent."
-fi
+user=$(whoami)
 
-# Remove the job run ID file
-rm job_run_id.txt
+today=$(date "+%Y%m%d")
+time=$(date +"%Y-%m-%d %H:%M:%S")
+
+declare -A latest_files
+
+
+for file in "$folder_path"/*; do
+
+  #Condition that matches file names having projectname befoore "prod" and today's date after "prod"
+
+  if [[ "$file" =~ ^(.*)_prod_${today}.sql.gz$ ]]; then
+
+    project_name=$(basename "$file" | cut -d'_' -f1) #For filename "reflexvms_prod_20230419", project_name will be "reflexvms"
+
+    file_date=$(date -r "$file" +"%Y%m%d") #Gives the modification date of file
+
+    #Check if the file is the latest_files array for this project or not
+
+    if [[ -z ${latest_files[$project_name]} || $file_date -gt ${latest_files[$project_name]} ]]; then
+
+      #update the latest file for the project
+
+      latest_files[$project_name]=$file_date
+    fi
+  fi
+done
+
+# Create databases for each project with latest file
+
+for project_name in "${!latest_files[@]}"; do
+
+  #extract latest file name for project
+
+  latest_file=$(ls -t "${folder_path}/${project_name}"*_prod_*.sql.gz | head -n1)
+
+  #Extract DB name
+
+  DB_NAME="${project_name}_prod"
+
+  if mysql -u $DB_USER -p$DB_PASSWORD -e "use $DB_NAME" >/dev/null 2>&1; then
+
+    echo "Database $DB_NAME already exists, Dropping..."
+
+    echo "${time} - ${user} - Database $DB_NAME dropped" >> $log_file
+
+    mysql -u $DB_USER -p$DB_PASSWORD -e "DROP DATABASE ${DB_NAME}"
+
+  fi
+
+  #Create new DB
+
+  mysql -u $DB_USER -p$DB_PASSWORD -e "CREATE DATABASE ${DB_NAME};"
+
+  if [[ "$?" -eq 0 ]]; then
+
+    echo "${time} - ${user} - Database $DB_NAME created" >> ${log_file}
+
+    aws ses send-email --from mallickatm06@gmail.com --to ashutoshmallick1003@gmail.com --subject "Database was created successfully" --text "Database $DB_NAME was created successfully"
+
+  else
+
+    echo "${time} - ${user} - Failed to create Database $DB_NAME" >> ${log_file}
+
+    aws ses send-email --from mallickatm06@gmail.com --to ashutoshmallick1003@gmail.com --subject " Failed to create Database" --text "There was an error creating database $DB_NAME please check"
+  fi
+
+  #Restore backup
+
+  if gunzip < "$latest_file" | mysql -u $DB_USER -p$DB_PASSWORD "$DB_NAME"; then
+
+    echo "${time} - ${user} - Database $DB_NAME Backup is Done" >> ${log_file}
+
+    aws ses send-email --from mallickatm06@gmail.com --to ashutoshmallick1003@gmail.com --subject " Backup restore Successful" --text "Backup for $DB_NAME was restored successfully"
+
+  fi
+
+  #Remove backup file
+
+  for OLD_FILE in $(ls -t $folder_path/$DB_NAME* | tail -n+2); do
+    rm -rf $OLD_FILE
+    echo "Deleted old backup file: $OLD_FILE"
+  done
+done
